@@ -43,7 +43,7 @@ curl -fsSL https://raw.githubusercontent.com/chantanawat/ClipHistory/main/uninst
 
 ```sh
 git clone https://github.com/chantanawat/ClipHistory.git && cd ClipHistory
-./release.sh        # builds universal app -> dist/release/ClipHistory.zip
+./release/release.sh      # builds universal app -> dist/release/ClipHistory.zip
 ```
 
 ## License
