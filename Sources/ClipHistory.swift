@@ -336,6 +336,7 @@ private final class ClipRowView: NSTableCellView {
         let previewLabel = NSTextField(wrappingLabelWithString: Self.previewText(for: entry))
         previewLabel.font = .systemFont(ofSize: 13)
         previewLabel.textColor = .labelColor
+        previewLabel.isSelectable = false
         previewLabel.maximumNumberOfLines = 2
         previewLabel.lineBreakMode = .byWordWrapping
         previewLabel.cell?.truncatesLastVisibleLine = true
@@ -450,7 +451,15 @@ private final class ClipRowView: NSTableCellView {
         addCursorRect(bounds, cursor: .pointingHand)
     }
 
-    // Buttons are hit-tested first; only clicks on the row body reach here. One click pastes.
+    // The whole row is one paste target: only the pin/delete buttons keep their own clicks.
+    // Without this the wrapping preview label (selectable by default) swallows clicks on the text.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard let hit = super.hitTest(point) else { return nil }
+        if hit.isDescendant(of: pinButton) || hit.isDescendant(of: deleteButton) { return hit }
+        return self
+    }
+
+    // One click anywhere on the row body pastes.
     override func mouseDown(with event: NSEvent) {}
 
     override func mouseUp(with event: NSEvent) {
@@ -463,7 +472,7 @@ private final class ClipRowView: NSTableCellView {
     }
 }
 
-private final class HistoryViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate {
+private final class HistoryViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate {
     private let tableView = NSTableView()
     private let scrollView = NSScrollView()
     private let titleLabel = NSTextField(labelWithString: "คลิปบอร์ดล่าสุด")
@@ -477,11 +486,18 @@ private final class HistoryViewController: NSViewController, NSTableViewDataSour
     private let emptyLabel = NSTextField(labelWithString: "ยังไม่มีประวัติคลิปบอร์ด")
     private let screenshotStatusLabel = NSTextField(labelWithString: "")
     private let pasteStatusLabel = NSTextField(labelWithString: "")
+    private let limitFeedbackLabel = NSTextField(wrappingLabelWithString: "")
+    private let settingsStatusIcon = NSImageView()
+    private let settingsStatusLabel = NSTextField(labelWithString: "")
+    private let settingsStatusRow = NSStackView()
+    private var limitCommitTimer: Timer?
+    private var statusHideWork: DispatchWorkItem?
     private let tableColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("entry"))
     private var scrollTopWithSearch: NSLayoutConstraint!
     private var scrollTopWithoutSearch: NSLayoutConstraint!
     private var visibleEntries: [ClipEntry] = []
     private var screenshotStatusText = ""
+    private var carriedPasteStatus = ""
     var onChoose: ((ClipEntry) -> Void)?
 
     private func symbolImage(_ name: String, label: String) -> NSImage? {
@@ -598,6 +614,20 @@ private final class HistoryViewController: NSViewController, NSTableViewDataSour
         refresh()
     }
 
+    private static func sectionHeader(_ text: String) -> NSTextField {
+        let label = NSTextField(labelWithString: text)
+        label.font = .systemFont(ofSize: 11, weight: .semibold)
+        label.textColor = .secondaryLabelColor
+        return label
+    }
+
+    private static func separator() -> NSBox {
+        let box = NSBox()
+        box.boxType = .separator
+        box.translatesAutoresizingMaskIntoConstraints = false
+        return box
+    }
+
     private func buildSettingsPanel() {
         settingsPanel.material = .windowBackground
         settingsPanel.blendingMode = .withinWindow
@@ -605,32 +635,40 @@ private final class HistoryViewController: NSViewController, NSTableViewDataSour
         settingsPanel.isHidden = true
         settingsPanel.translatesAutoresizingMaskIntoConstraints = false
 
+        // Every setting applies on its own (no save button); this line says so up front.
+        let autosaveNote = NSTextField(wrappingLabelWithString: "ทุกอย่างบันทึกให้อัตโนมัติทันทีที่เปลี่ยน ไม่ต้องกดบันทึก")
+        autosaveNote.isSelectable = false
+        autosaveNote.font = .systemFont(ofSize: 12)
+        autosaveNote.textColor = .secondaryLabelColor
+
         let limitTitle = NSTextField(labelWithString: "จำนวนรายการที่เก็บไว้")
         limitTitle.font = .systemFont(ofSize: 13, weight: .medium)
-        let formatter = NumberFormatter()
-        formatter.numberStyle = .none
-        formatter.allowsFloats = false
-        formatter.minimum = NSNumber(value: AppSettings.maxEntriesRange.lowerBound)
-        formatter.maximum = NSNumber(value: AppSettings.maxEntriesRange.upperBound)
-        limitField.formatter = formatter
+        // No formatter on purpose: a formatter with min/max refuses to end editing on out-of-range input,
+        // which traps focus and silently drops the value. Parsing + clamping happens in commitLimitField().
         limitField.alignment = .right
+        limitField.delegate = self
         limitField.target = self
         limitField.action = #selector(limitFieldChanged)
+        limitField.cell?.sendsActionOnEndEditing = true
+        limitField.setAccessibilityLabel("จำนวนรายการที่เก็บไว้")
         limitField.translatesAutoresizingMaskIntoConstraints = false
-        limitField.widthAnchor.constraint(equalToConstant: 52).isActive = true
+        limitField.widthAnchor.constraint(equalToConstant: 56).isActive = true
         limitStepper.minValue = Double(AppSettings.maxEntriesRange.lowerBound)
         limitStepper.maxValue = Double(AppSettings.maxEntriesRange.upperBound)
         limitStepper.increment = 1
         limitStepper.valueWraps = false
         limitStepper.target = self
         limitStepper.action = #selector(limitStepperChanged)
+        limitStepper.setAccessibilityLabel("เพิ่มหรือลดจำนวนรายการ")
         let limitRow = NSStackView(views: [limitTitle, NSView(), limitField, limitStepper])
         limitRow.orientation = .horizontal
         limitRow.spacing = 6
 
-        let limitHint = NSTextField(wrappingLabelWithString: "ตั้งได้ \(AppSettings.maxEntriesRange.lowerBound)–\(AppSettings.maxEntriesRange.upperBound) รายการ (ค่าเริ่มต้น \(AppSettings.defaultMaxEntries)) · เมื่อเกิน รายการเก่าสุดจะถูกลบ ส่วนรายการที่ปักหมุดไม่นับและไม่ถูกลบ")
-        limitHint.font = .systemFont(ofSize: 11)
-        limitHint.textColor = .secondaryLabelColor
+        limitFeedbackLabel.isSelectable = false
+        limitFeedbackLabel.font = .systemFont(ofSize: 11)
+        limitFeedbackLabel.maximumNumberOfLines = 3
+        limitFeedbackLabel.lineBreakMode = .byWordWrapping
+        showLimitHint()
 
         searchToggle.target = self
         searchToggle.action = #selector(searchToggled)
@@ -639,31 +677,73 @@ private final class HistoryViewController: NSViewController, NSTableViewDataSour
 
         let clearButton = NSButton(title: "ล้างประวัติ…", target: self, action: #selector(clearHistory))
         clearButton.bezelStyle = .rounded
-        let quitButton = NSButton(title: "ออกจากแอป", target: self, action: #selector(quitApp))
-        quitButton.bezelStyle = .rounded
-        let buttonRow = NSStackView(views: [clearButton, quitButton])
-        buttonRow.orientation = .horizontal
-        buttonRow.spacing = 8
+        let clearHint = NSTextField(wrappingLabelWithString: "ลบทุกรายการในเครื่อง ยกเว้นรายการที่ปักหมุด (จะถามยืนยันก่อน)")
+        clearHint.isSelectable = false
+        clearHint.font = .systemFont(ofSize: 11)
+        clearHint.textColor = .secondaryLabelColor
 
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
-        let versionLabel = NSTextField(labelWithString: "ClipHistory \(version) · เปิดประวัติด้วย ⌘⇧V")
+        let versionLabel = NSTextField(labelWithString: "ClipHistory \(version) · เปิดประวัติด้วย ⌘ Command + ⇧ Shift + V")
         versionLabel.font = .systemFont(ofSize: 11)
         versionLabel.textColor = .secondaryLabelColor
+        versionLabel.lineBreakMode = .byTruncatingTail
+        let quitButton = NSButton(title: "ออกจากแอป", target: self, action: #selector(quitApp))
+        quitButton.bezelStyle = .rounded
+        quitButton.controlSize = .small
+        quitButton.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        let aboutRow = NSStackView(views: [versionLabel, NSView(), quitButton])
+        aboutRow.orientation = .horizontal
+        aboutRow.spacing = 8
 
-        let stack = NSStackView(views: [limitRow, limitHint, searchToggle, launchToggle, buttonRow, versionLabel])
+        // Footer: save confirmation on the left, the one primary action on the right.
+        settingsStatusIcon.imageScaling = .scaleNone
+        settingsStatusLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        settingsStatusRow.setViews([settingsStatusIcon, settingsStatusLabel], in: .leading)
+        settingsStatusRow.orientation = .horizontal
+        settingsStatusRow.spacing = 4
+        settingsStatusRow.alphaValue = 0
+        let doneButton = NSButton(title: "เสร็จ", target: self, action: #selector(doneSettings))
+        doneButton.bezelStyle = .rounded
+        doneButton.bezelColor = .controlAccentColor
+        doneButton.toolTip = "กลับไปหน้าประวัติ"
+        doneButton.translatesAutoresizingMaskIntoConstraints = false
+        doneButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 80).isActive = true
+        let footer = NSStackView(views: [settingsStatusRow, NSView(), doneButton])
+        footer.orientation = .horizontal
+        footer.spacing = 8
+
+        let stack = NSStackView(views: [
+            autosaveNote,
+            Self.sectionHeader("ประวัติ"), limitRow, limitFeedbackLabel,
+            Self.separator(),
+            Self.sectionHeader("การใช้งาน"), searchToggle, launchToggle,
+            Self.separator(),
+            Self.sectionHeader("ข้อมูล"), clearButton, clearHint,
+            Self.separator(),
+            aboutRow
+        ])
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 14
-        stack.setCustomSpacing(6, after: limitRow)
+        stack.spacing = 10
         stack.translatesAutoresizingMaskIntoConstraints = false
+        footer.translatesAutoresizingMaskIntoConstraints = false
         settingsPanel.addSubview(stack)
-        NSLayoutConstraint.activate([
+        settingsPanel.addSubview(footer)
+        var constraints = [
             stack.leadingAnchor.constraint(equalTo: settingsPanel.leadingAnchor, constant: 16),
             stack.trailingAnchor.constraint(equalTo: settingsPanel.trailingAnchor, constant: -16),
-            stack.topAnchor.constraint(equalTo: settingsPanel.topAnchor, constant: 8),
-            limitRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            limitHint.widthAnchor.constraint(equalTo: stack.widthAnchor)
-        ])
+            stack.topAnchor.constraint(equalTo: settingsPanel.topAnchor, constant: 4),
+            footer.leadingAnchor.constraint(equalTo: settingsPanel.leadingAnchor, constant: 16),
+            footer.trailingAnchor.constraint(equalTo: settingsPanel.trailingAnchor, constant: -16),
+            footer.bottomAnchor.constraint(equalTo: settingsPanel.bottomAnchor, constant: -4),
+            footer.topAnchor.constraint(greaterThanOrEqualTo: stack.bottomAnchor, constant: 12)
+        ]
+        // Full-width rows so wrapping labels and separators span the panel.
+        for view in stack.arrangedSubviews where view is NSBox || view === limitRow || view === aboutRow
+            || view === autosaveNote || view === limitFeedbackLabel || view === clearHint {
+            constraints.append(view.widthAnchor.constraint(equalTo: stack.widthAnchor))
+        }
+        NSLayoutConstraint.activate(constraints)
     }
 
     override func viewDidLayout() {
@@ -673,8 +753,7 @@ private final class HistoryViewController: NSViewController, NSTableViewDataSour
     }
 
     private func syncSettingsControls() {
-        limitField.integerValue = AppSettings.maxEntries
-        limitStepper.integerValue = AppSettings.maxEntries
+        syncLimitControls()
         searchToggle.state = AppSettings.searchEnabled ? .on : .off
         launchToggle.state = LaunchAtLogin.isEnabled ? .on : .off
     }
@@ -727,13 +806,15 @@ private final class HistoryViewController: NSViewController, NSTableViewDataSour
 
     func setPasteStatus(_ text: String) {
         pasteStatusLabel.stringValue = text
+        // Failures after the popover closed would otherwise be wiped by the next prepareForDisplay().
+        if view.window?.isVisible != true { carriedPasteStatus = text }
     }
 
     func prepareForDisplay() {
         guard isViewLoaded else { return }
-        pasteStatusLabel.stringValue = ""
-        settingsPanel.isHidden = true
-        gearButton.contentTintColor = .secondaryLabelColor
+        pasteStatusLabel.stringValue = carriedPasteStatus
+        carriedPasteStatus = ""
+        setSettingsVisible(false)
         searchField.stringValue = ""
         refresh()
     }
@@ -744,9 +825,42 @@ private final class HistoryViewController: NSViewController, NSTableViewDataSour
     }
 
     @objc private func toggleSettings() {
-        settingsPanel.isHidden.toggle()
-        gearButton.contentTintColor = settingsPanel.isHidden ? .secondaryLabelColor : .controlAccentColor
-        if !settingsPanel.isHidden { syncSettingsControls() }
+        if settingsPanel.isHidden {
+            syncSettingsControls()
+            showLimitHint()
+            setSettingsVisible(true)
+            // Drop the search field's focus ring while settings cover the list; keys typed here must not filter it.
+            view.window?.makeFirstResponder(nil)
+        } else {
+            doneSettings()
+        }
+    }
+
+    // Clicks on empty space (panel background, labels, header) bubble up the responder chain to here.
+    // Ending the edit there commits a typed value, like clicking elsewhere in any Mac settings window.
+    override func mouseDown(with event: NSEvent) {
+        if !settingsPanel.isHidden {
+            commitPendingSettings()
+        } else {
+            super.mouseDown(with: event)
+        }
+    }
+
+    @objc private func doneSettings() {
+        commitPendingSettings()
+        setSettingsVisible(false)
+        focusSearchIfEnabled()
+    }
+
+    private func setSettingsVisible(_ visible: Bool) {
+        settingsPanel.isHidden = !visible
+        titleLabel.stringValue = visible ? "ตั้งค่า" : "คลิปบอร์ดล่าสุด"
+        gearButton.contentTintColor = visible ? .controlAccentColor : .secondaryLabelColor
+        gearButton.toolTip = visible ? "ปิดการตั้งค่า" : "ตั้งค่า"
+        if !visible {
+            statusHideWork?.cancel()
+            settingsStatusRow.alphaValue = 0
+        }
     }
 
     @objc private func searchChanged() { refresh() }
@@ -755,17 +869,84 @@ private final class HistoryViewController: NSViewController, NSTableViewDataSour
         AppSettings.searchEnabled = searchToggle.state == .on
         applySearchVisibility()
         refresh()
+        showSettingsStatus("บันทึกแล้ว")
     }
 
     @objc private func launchToggled() {
-        if !LaunchAtLogin.set(launchToggle.state == .on) { launchToggle.state = LaunchAtLogin.isEnabled ? .on : .off }
+        if LaunchAtLogin.set(launchToggle.state == .on) {
+            showSettingsStatus("บันทึกแล้ว")
+        } else {
+            launchToggle.state = LaunchAtLogin.isEnabled ? .on : .off
+            showSettingsStatus("ตั้งเปิดอัตโนมัติไม่สำเร็จ ลองกดอีกครั้ง", isError: true)
+        }
     }
 
-    @objc private func limitFieldChanged() { applyLimit(limitField.integerValue) }
-    @objc private func limitStepperChanged() { applyLimit(limitStepper.integerValue) }
+    // MARK: Item limit — typed value commits on Return, Tab, clicking elsewhere, "เสร็จ" or closing the popover.
 
-    private func applyLimit(_ requested: Int) {
-        let limit = AppSettings.clamp(requested)
+    private static let limitRangeText = "\(AppSettings.maxEntriesRange.lowerBound)–\(AppSettings.maxEntriesRange.upperBound)"
+
+    private func showLimitHint() {
+        limitFeedbackLabel.textColor = .secondaryLabelColor
+        limitFeedbackLabel.stringValue = "ตั้งได้ \(Self.limitRangeText) รายการ (ค่าเริ่มต้น \(AppSettings.defaultMaxEntries)) · เมื่อเกิน รายการเก่าสุดจะถูกลบ · รายการที่ปักหมุดไม่นับและไม่ถูกลบ"
+    }
+
+    private static func parseLimit(_ text: String) -> Int? {
+        let digits = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !digits.isEmpty, digits.allSatisfy({ $0.isASCII && $0.isNumber }) else { return nil }
+        return Int(digits.prefix(6))
+    }
+
+    // Live preview while typing: says what will happen, deletes nothing yet.
+    func controlTextDidChange(_ obj: Notification) {
+        guard (obj.object as? NSTextField) === limitField else { return }
+        guard let value = Self.parseLimit(limitField.stringValue) else {
+            limitFeedbackLabel.textColor = .systemRed
+            limitFeedbackLabel.stringValue = limitField.stringValue.isEmpty
+                ? "ใส่ตัวเลข \(Self.limitRangeText)"
+                : "ใส่ได้เฉพาะตัวเลข \(Self.limitRangeText)"
+            return
+        }
+        let limit = AppSettings.clamp(value)
+        let overflow = HistoryStore.shared.overflowCount(forLimit: limit)
+        if limit != value {
+            limitFeedbackLabel.textColor = .systemOrange
+            limitFeedbackLabel.stringValue = "ตั้งได้ \(Self.limitRangeText) · จะบันทึกเป็น \(limit)"
+        } else if overflow > 0 {
+            limitFeedbackLabel.textColor = .systemOrange
+            limitFeedbackLabel.stringValue = "รายการเก่าสุด \(overflow) รายการจะถูกลบเมื่อบันทึก"
+        } else {
+            showLimitHint()
+        }
+    }
+
+    @objc private func limitFieldChanged() { commitLimitField() }
+
+    @objc private func limitStepperChanged() {
+        limitField.stringValue = String(limitStepper.integerValue)
+        controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: limitField))
+        // Debounced so a run of clicks commits once (and asks at most once before deleting).
+        limitCommitTimer?.invalidate()
+        limitCommitTimer = Timer.scheduledTimer(withTimeInterval: 0.8, repeats: false) { [weak self] _ in
+            self?.commitLimitField()
+        }
+    }
+
+    private func commitLimitField() {
+        limitCommitTimer?.invalidate()
+        limitCommitTimer = nil
+        let current = AppSettings.maxEntries
+        guard let value = Self.parseLimit(limitField.stringValue) else {
+            syncLimitControls()
+            showLimitHint()
+            showSettingsStatus("ตัวเลขไม่ถูกต้อง ใช้ค่าเดิม \(current)", isError: true)
+            return
+        }
+        let limit = AppSettings.clamp(value)
+        guard limit != current else {
+            syncLimitControls()
+            showLimitHint()
+            return
+        }
         let overflow = HistoryStore.shared.overflowCount(forLimit: limit)
         if overflow > 5 {
             let alert = NSAlert()
@@ -774,13 +955,59 @@ private final class HistoryViewController: NSViewController, NSTableViewDataSour
             alert.addButton(withTitle: "ลบรายการเก่า")
             alert.addButton(withTitle: "ยกเลิก")
             guard alert.runModal() == .alertFirstButtonReturn else {
-                syncSettingsControls()
+                syncLimitControls()
+                showLimitHint()
+                showSettingsStatus("ยกเลิกแล้ว ใช้ค่าเดิม \(current)", isError: true)
                 return
             }
         }
         AppSettings.maxEntries = limit
-        syncSettingsControls()
         HistoryStore.shared.applyLimitChange()
+        syncLimitControls()
+        showLimitHint()
+        showSettingsStatus(limit == value ? "บันทึกแล้ว · เก็บ \(limit) รายการ" : "บันทึกเป็น \(limit) (ตั้งได้ \(Self.limitRangeText))")
+    }
+
+    private func syncLimitControls() {
+        limitField.integerValue = AppSettings.maxEntries
+        limitStepper.integerValue = AppSettings.maxEntries
+    }
+
+    /// Ends any in-progress edit so a typed value is saved, not lost. Called before the panel or popover closes.
+    func commitPendingSettings() {
+        guard isViewLoaded, !settingsPanel.isHidden else { return }
+        if limitField.currentEditor() != nil {
+            view.window?.makeFirstResponder(nil) // fires limitFieldChanged via sendsActionOnEndEditing
+        } else if limitCommitTimer != nil {
+            commitLimitField()
+        }
+    }
+
+    private func showSettingsStatus(_ text: String, isError: Bool = false) {
+        let symbol = isError ? "exclamationmark.circle.fill" : "checkmark.circle.fill"
+        let color: NSColor = isError ? .systemOrange : .systemGreen
+        settingsStatusIcon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 12, weight: .semibold))
+        settingsStatusIcon.contentTintColor = color
+        settingsStatusLabel.stringValue = text
+        settingsStatusLabel.textColor = isError ? .labelColor : .secondaryLabelColor
+        settingsStatusRow.alphaValue = 1
+        NSAccessibility.post(element: settingsStatusLabel, notification: .announcementRequested,
+                             userInfo: [.announcement: text, .priority: NSAccessibilityPriorityLevel.medium.rawValue])
+        statusHideWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let row = self?.settingsStatusRow else { return }
+            if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+                row.alphaValue = 0
+            } else {
+                NSAnimationContext.runAnimationGroup { context in
+                    context.duration = 0.25
+                    row.animator().alphaValue = 0
+                }
+            }
+        }
+        statusHideWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + (isError ? 4 : 2.5), execute: work)
     }
 
     @objc private func clearHistory() {
@@ -977,8 +1204,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDeleg
     ) {
         guard attemptsRemaining > 0 else {
             pasteInProgress = false
-            historyController.setPasteStatus("ยังไม่ได้รับสิทธิ์วางอัตโนมัติ · อนุญาต ClipHistory ใน Accessibility")
-            NSLog("ClipHistory: timed out waiting for paste permission")
+            // A switch that is already on but still untrusted means the grant belongs to an older signature;
+            // toggling it does not help, the entry has to be removed and added again.
+            historyController.setPasteStatus("คัดลอกแล้ว กด ⌘V เพื่อวาง · วางอัตโนมัติไม่ได้: ลบ ClipHistory (−) ใน Accessibility แล้วเพิ่มใหม่")
+            NSLog("ClipHistory: timed out waiting for paste permission (AX trusted: %d, post event: %d)", AXIsProcessTrusted() ? 1 : 0, CGPreflightPostEventAccess() ? 1 : 0)
             return
         }
         if !AXIsProcessTrusted() {
@@ -1008,6 +1237,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDeleg
         } else {
             beginPendingPaste()
         }
+    }
+
+    // Save a half-typed setting before the popover goes away (click outside, ⌘⇧V, Esc).
+    func popoverShouldClose(_ popover: NSPopover) -> Bool {
+        historyController.commitPendingSettings()
+        return true
     }
 
     func popoverDidClose(_ notification: Notification) {
@@ -1044,6 +1279,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDeleg
         }
         guard attemptsRemaining > 0 else {
             pasteInProgress = false
+            historyController.setPasteStatus("คัดลอกแล้ว · สลับกลับแอปปลายทางไม่ได้ กด ⌘V เพื่อวาง")
             NSLog("ClipHistory: target app did not become active before paste")
             return
         }

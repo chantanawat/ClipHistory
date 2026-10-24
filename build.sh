@@ -5,7 +5,8 @@
 set -eu
 
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-APP="$ROOT/dist/ClipHistory.app"
+# CLIPHISTORY_OUT lets release.sh build elsewhere so it never replaces the locally signed app in use.
+APP="${CLIPHISTORY_OUT:-$ROOT/dist/ClipHistory.app}"
 SDK="$(xcrun --sdk macosx --show-sdk-path)"
 MODULE_CACHE="$ROOT/.build/module-cache"
 SLICES="$ROOT/.build/slices"
